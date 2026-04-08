@@ -48,11 +48,10 @@ class ConversationRuntime:
                 interrupted = True
                 break
 
-            turn_number = api_call_count + 1
-            self.backend.on_turn_start(turn_number)
             if not iteration_budget.consume():
                 break
-            api_call_count = turn_number
+            api_call_count += 1
+            self.backend.on_turn_start(api_call_count)
             self.backend.on_iteration(api_call_count, prev_tool_names)
 
             api_messages = build_api_messages(messages, system_prompt)
