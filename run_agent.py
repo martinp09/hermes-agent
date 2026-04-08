@@ -101,6 +101,8 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
+from agent.conversation_runtime import ConversationRuntime, TurnSummary as RuntimeTurnSummary
+from agent.runtime_backend import RuntimeBackend
 from utils import atomic_json_write, env_var_enabled
 
 
@@ -467,7 +469,7 @@ def _save_oversized_tool_result(function_name: str, function_result: str) -> str
         )
 
 
-class AIAgent:
+class AIAgent(RuntimeBackend):
     """
     AI Agent with tool calling capabilities.
 
@@ -654,6 +656,7 @@ class AIAgent:
         self.stream_delta_callback = stream_delta_callback
         self.status_callback = status_callback
         self.tool_gen_callback = tool_gen_callback
+        self._runtime = ConversationRuntime(backend=self, max_iterations=self.max_iterations)
 
         
         # Tool execution state — allows _vprint during tool execution
@@ -4256,6 +4259,87 @@ class AIAgent:
             raise result["error"]
         return result["response"]
 
+    # Runtime backend adapters (ConversationRuntime protocol)
+    def make_api_call(self, api_kwargs: dict):
+        return self._interruptible_api_call(api_kwargs)
+
+    def execute_tools(self, assistant_message, messages: list, task_id: str) -> list:
+        tool_calls = list(getattr(assistant_message, "tool_calls", []) or [])
+        self._execute_tool_calls(assistant_message, messages, task_id)
+        by_id = {m.get("tool_call_id"): m.get("content", "") for m in messages if isinstance(m, dict) and m.get("role") == "tool"}
+        events = []
+        for tc in tool_calls:
+            tool_name = getattr(getattr(tc, "function", None), "name", "") or ""
+            result = by_id.get(getattr(tc, "id", None), "")
+            events.append({
+                "name": tool_name,
+                "result": result,
+                "is_error": _detect_tool_failure(result),
+            })
+        return events
+
+    def should_compress(self, estimated_tokens: int) -> bool:
+        return self.context_compressor.should_compress(estimated_tokens)
+
+    def compress_context(self, messages: list, system_prompt: str, model: str, base_url: str) -> tuple:
+        return self._compress_context(messages, system_prompt)
+
+    def persist_session(self) -> None:
+        self._persist_session(self._session_messages)
+
+    def on_turn_start(self, turn_number: int) -> None:
+        pass
+
+    def on_tool_executed(self, tool_name: str, is_error: bool) -> None:
+        pass
+
+    def on_iteration(self, iteration: int, prev_tool_names: list) -> None:
+        if self.step_callback:
+            self.step_callback(iteration, prev_tool_names)
+
+    def _runtime_parse_response(self, response: Any) -> dict:
+        finish_reason = "stop"
+        if self.api_mode == "codex_responses":
+            assistant_message, finish_reason = self._normalize_codex_response(response)
+        elif self.api_mode == "anthropic_messages":
+            from agent.anthropic_adapter import normalize_anthropic_response
+
+            assistant_message, finish_reason = normalize_anthropic_response(
+                response, strip_tool_prefix=self._is_anthropic_oauth
+            )
+        else:
+            assistant_message = response.choices[0].message
+            finish_reason = response.choices[0].finish_reason or "stop"
+
+        if assistant_message.content is not None and not isinstance(assistant_message.content, str):
+            raw = assistant_message.content
+            if isinstance(raw, dict):
+                assistant_message.content = raw.get("text", "") or raw.get("content", "") or json.dumps(raw)
+            elif isinstance(raw, list):
+                parts = []
+                for part in raw:
+                    if isinstance(part, str):
+                        parts.append(part)
+                    elif isinstance(part, dict) and part.get("type") == "text":
+                        parts.append(part.get("text", ""))
+                    elif isinstance(part, dict) and "text" in part:
+                        parts.append(str(part["text"]))
+                assistant_message.content = "\n".join(parts)
+            else:
+                assistant_message.content = str(raw)
+
+        assistant_dict = self._build_assistant_message(assistant_message, finish_reason)
+        final_response = None
+        if not getattr(assistant_message, "tool_calls", None):
+            final_response = self._strip_think_blocks(assistant_message.content or "").strip()
+        return {
+            "assistant_message": assistant_message,
+            "assistant_dict": assistant_dict,
+            "tool_calls": getattr(assistant_message, "tool_calls", None) or [],
+            "final_response": final_response,
+            "finish_reason": finish_reason,
+        }
+
     # ── Unified streaming API call ─────────────────────────────────────────
 
     def _fire_stream_delta(self, text: str) -> None:
@@ -7109,7 +7193,75 @@ class AIAgent:
             except Exception:
                 pass
 
-        while api_call_count < self.max_iterations and self.iteration_budget.remaining > 0:
+        _USE_NEW_RUNTIME = os.getenv("HERMES_USE_NEW_RUNTIME", "").strip().lower() in {"1", "true", "yes"}
+        if _USE_NEW_RUNTIME:
+            def _build_runtime_api_messages(runtime_messages: list, runtime_system_prompt: str) -> list:
+                api_messages = []
+                for idx, msg in enumerate(runtime_messages):
+                    api_msg = msg.copy()
+                    if idx == current_turn_user_idx and msg.get("role") == "user":
+                        _injections = []
+                        if _ext_prefetch_cache:
+                            _fenced = build_memory_context_block(_ext_prefetch_cache)
+                            if _fenced:
+                                _injections.append(_fenced)
+                        if _plugin_user_context:
+                            _injections.append(_plugin_user_context)
+                        if _injections:
+                            _base = api_msg.get("content", "")
+                            if isinstance(_base, str):
+                                api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
+                    if msg.get("role") == "assistant":
+                        reasoning_text = msg.get("reasoning")
+                        if reasoning_text:
+                            api_msg["reasoning_content"] = reasoning_text
+                    api_msg.pop("reasoning", None)
+                    api_msg.pop("finish_reason", None)
+                    api_msg.pop("_thinking_prefill", None)
+                    if self._should_sanitize_tool_calls():
+                        self._sanitize_tool_calls_for_strict_api(api_msg)
+                    api_messages.append(api_msg)
+
+                effective_system = runtime_system_prompt or ""
+                if self.ephemeral_system_prompt:
+                    effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+                if effective_system:
+                    api_messages = [{"role": "system", "content": effective_system}] + api_messages
+
+                if self.prefill_messages:
+                    sys_offset = 1 if effective_system else 0
+                    for idx, pfm in enumerate(self.prefill_messages):
+                        api_messages.insert(sys_offset + idx, pfm.copy())
+                if self._use_prompt_caching:
+                    api_messages = apply_anthropic_cache_control(
+                        api_messages,
+                        cache_ttl=self._cache_ttl,
+                        native_anthropic=(self.api_mode == "anthropic_messages"),
+                    )
+                return self._sanitize_api_messages(api_messages)
+
+            runtime_summary: RuntimeTurnSummary = self._runtime.run(
+                messages=messages,
+                system_prompt=active_system_prompt,
+                model=self.model,
+                base_url=self.base_url,
+                task_id=effective_task_id,
+                iteration_budget=self.iteration_budget,
+                build_api_messages=_build_runtime_api_messages,
+                build_api_kwargs=self._build_api_kwargs,
+                parse_response=self._runtime_parse_response,
+                estimate_tokens=estimate_messages_tokens_rough,
+                interrupt_check=lambda: self._interrupt_requested,
+            )
+            messages = runtime_summary.messages
+            active_system_prompt = runtime_summary.system_prompt
+            final_response = runtime_summary.final_response
+            interrupted = runtime_summary.interrupted
+            api_call_count = runtime_summary.api_calls
+            self._session_messages = messages
+            self._save_session_log(messages)
+
+        while (not _USE_NEW_RUNTIME) and api_call_count < self.max_iterations and self.iteration_budget.remaining > 0:
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
             self._checkpoint_mgr.new_turn()
 
