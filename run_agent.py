@@ -4270,7 +4270,13 @@ class AIAgent(RuntimeBackend):
 
     def execute_tools(self, assistant_message, messages: list, task_id: str) -> list:
         tool_calls = list(getattr(assistant_message, "tool_calls", []) or [])
-        self._execute_tool_calls(assistant_message, messages, task_id)
+        messages, _ = self._execute_tool_calls(
+            assistant_message,
+            messages,
+            task_id,
+            system_message=None,
+            active_system_prompt=self._cached_system_prompt,
+        )
         by_id = {m.get("tool_call_id"): m.get("content", "") for m in messages if isinstance(m, dict) and m.get("role") == "tool"}
         events = []
         for tc in tool_calls:
@@ -6034,7 +6040,15 @@ class AIAgent(RuntimeBackend):
         )
         return compressed, new_system_prompt
 
-    def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+    def _execute_tool_calls(
+        self,
+        assistant_message,
+        messages: list,
+        effective_task_id: str,
+        api_call_count: int = 0,
+        system_message: str = None,
+        active_system_prompt: str = None,
+    ) -> tuple[list, str]:
         """Execute tool calls from the assistant message and append results to messages.
 
         Dispatches to concurrent execution only for batches that look
@@ -6048,14 +6062,58 @@ class AIAgent(RuntimeBackend):
         try:
             if not _should_parallelize_tool_batch(tool_calls):
                 return self._execute_tool_calls_sequential(
-                    assistant_message, messages, effective_task_id, api_call_count
+                    assistant_message,
+                    messages,
+                    effective_task_id,
+                    api_call_count,
+                    system_message=system_message,
+                    active_system_prompt=active_system_prompt,
                 )
 
             return self._execute_tool_calls_concurrent(
-                assistant_message, messages, effective_task_id, api_call_count
+                assistant_message,
+                messages,
+                effective_task_id,
+                api_call_count,
+                system_message=system_message,
+                active_system_prompt=active_system_prompt,
             )
         finally:
             self._executing_tools = False
+
+    def _maybe_proactive_compress_post_tools(
+        self,
+        messages: list,
+        system_message: str,
+        active_system_prompt: str,
+        effective_task_id: str,
+    ) -> tuple[list, str]:
+        """Proactive compaction after tool results, before the next API call."""
+        if self.compression_enabled:
+            try:
+                _sys_est = estimate_tokens_rough(active_system_prompt or "")
+                _msg_est = estimate_messages_tokens_rough(messages)
+                _estimated_next_prompt = _sys_est + _msg_est
+                if self.context_compressor.should_compress(_estimated_next_prompt):
+                    logger.info(
+                        "Post-tool proactive compression: ~%s tokens >= %s threshold",
+                        f"{_estimated_next_prompt:,}",
+                        f"{self.context_compressor.threshold_tokens:,}",
+                    )
+                    compressed_messages, new_system = self._compress_context(
+                        messages,
+                        system_message,
+                        approx_tokens=_estimated_next_prompt,
+                        task_id=effective_task_id,
+                    )
+                    if compressed_messages is not None:
+                        messages = compressed_messages
+                        if new_system:
+                            active_system_prompt = new_system
+                            self._cached_system_prompt = new_system
+            except Exception as e:
+                logger.warning("Post-tool compression failed (non-fatal): %s", e)
+        return messages, active_system_prompt
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None) -> str:
@@ -6131,7 +6189,15 @@ class AIAgent(RuntimeBackend):
                 enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
             )
 
-    def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+    def _execute_tool_calls_concurrent(
+        self,
+        assistant_message,
+        messages: list,
+        effective_task_id: str,
+        api_call_count: int = 0,
+        system_message: str = None,
+        active_system_prompt: str = None,
+    ) -> tuple[list, str]:
         """Execute multiple tool calls concurrently using a thread pool.
 
         Results are collected in the original tool-call order and appended to
@@ -6149,7 +6215,7 @@ class AIAgent(RuntimeBackend):
                     "content": f"[Tool execution cancelled — {tc.function.name} was skipped due to user interrupt]",
                     "tool_call_id": tc.id,
                 })
-            return
+            return messages, active_system_prompt
 
         # ── Parse args + pre-execution bookkeeping ───────────────────────
         # list of (tool_call, function_name, function_args, should_execute, cancel_reason)
@@ -6363,6 +6429,14 @@ class AIAgent(RuntimeBackend):
             }
             messages.append(tool_msg)
 
+        # ── Proactive compression after tool results ────────────────────
+        messages, active_system_prompt = self._maybe_proactive_compress_post_tools(
+            messages,
+            system_message,
+            active_system_prompt,
+            effective_task_id,
+        )
+
         # ── Budget pressure injection ────────────────────────────────────
         budget_warning = self._get_budget_warning(api_call_count)
         if budget_warning and messages and messages[-1].get("role") == "tool":
@@ -6380,8 +6454,17 @@ class AIAgent(RuntimeBackend):
                 remaining = self.max_iterations - api_call_count
                 tier = "⚠️  WARNING" if remaining <= self.max_iterations * 0.1 else "💡 CAUTION"
                 print(f"{self.log_prefix}{tier}: {remaining} iterations remaining")
+        return messages, active_system_prompt
 
-    def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+    def _execute_tool_calls_sequential(
+        self,
+        assistant_message,
+        messages: list,
+        effective_task_id: str,
+        api_call_count: int = 0,
+        system_message: str = None,
+        active_system_prompt: str = None,
+    ) -> tuple[list, str]:
         """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
         for i, tool_call in enumerate(assistant_message.tool_calls, 1):
             # SAFETY: check interrupt BEFORE starting each tool.
@@ -6713,6 +6796,14 @@ class AIAgent(RuntimeBackend):
             if self.tool_delay > 0 and i < len(assistant_message.tool_calls):
                 time.sleep(self.tool_delay)
 
+        # ── Proactive compression after tool results ────────────────────
+        messages, active_system_prompt = self._maybe_proactive_compress_post_tools(
+            messages,
+            system_message,
+            active_system_prompt,
+            effective_task_id,
+        )
+
         # ── Budget pressure injection ─────────────────────────────────
         # After all tool calls in this turn are processed, check if we're
         # approaching max_iterations. If so, inject a warning into the LAST
@@ -6733,6 +6824,7 @@ class AIAgent(RuntimeBackend):
                 remaining = self.max_iterations - api_call_count
                 tier = "⚠️  WARNING" if remaining <= self.max_iterations * 0.1 else "💡 CAUTION"
                 print(f"{self.log_prefix}{tier}: {remaining} iterations remaining")
+        return messages, active_system_prompt
 
     def _get_budget_warning(self, api_call_count: int) -> Optional[str]:
         """Return a budget pressure string, or None if not yet needed.
@@ -8980,7 +9072,14 @@ class AIAgent(RuntimeBackend):
                         except Exception:
                             pass
 
-                    self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                    messages, active_system_prompt = self._execute_tool_calls(
+                        assistant_message,
+                        messages,
+                        effective_task_id,
+                        api_call_count,
+                        system_message=system_message,
+                        active_system_prompt=active_system_prompt,
+                    )
 
                     # Signal that a paragraph break is needed before the next
                     # streamed text.  We don't emit it immediately because
