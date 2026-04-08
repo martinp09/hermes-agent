@@ -101,6 +101,7 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
+from agent.hooks import HookRunner
 from agent.conversation_runtime import ConversationRuntime, TurnSummary as RuntimeTurnSummary
 from agent.runtime_backend import RuntimeBackend
 from utils import atomic_json_write, env_var_enabled
@@ -657,6 +658,7 @@ class AIAgent(RuntimeBackend):
         self.status_callback = status_callback
         self.tool_gen_callback = tool_gen_callback
         self._runtime = ConversationRuntime(backend=self, max_iterations=self.max_iterations)
+        self._hook_runner = HookRunner()
 
         
         # Tool execution state — allows _vprint during tool execution
@@ -1298,6 +1300,9 @@ class AIAgent(RuntimeBackend):
             self.context_compressor._context_probe_persistable = False
             # Iterative summary from previous session must not bleed into new one (#2635)
             self.context_compressor._previous_summary = None
+
+    def register_tool_hook(self, hook) -> None:
+        self._hook_runner.register(hook)
     
     def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
         """Switch the model/provider in-place for a live agent.
@@ -6147,7 +6152,8 @@ class AIAgent(RuntimeBackend):
             return
 
         # ── Parse args + pre-execution bookkeeping ───────────────────────
-        parsed_calls = []  # list of (tool_call, function_name, function_args)
+        # list of (tool_call, function_name, function_args, should_execute, cancel_reason)
+        parsed_calls = []
         for tool_call in tool_calls:
             function_name = tool_call.function.name
 
@@ -6164,8 +6170,28 @@ class AIAgent(RuntimeBackend):
             if not isinstance(function_args, dict):
                 function_args = {}
 
+            args_json = json.dumps(function_args, ensure_ascii=False)
+            pre_result = self._hook_runner.run_pre(function_name, args_json, tool_call.id)
+            should_execute = pre_result.should_execute
+            cancel_reason = pre_result.cancel_reason
+            if should_execute and pre_result.arguments != args_json:
+                try:
+                    modified_args = json.loads(pre_result.arguments)
+                    if isinstance(modified_args, dict):
+                        function_args = modified_args
+                    else:
+                        logger.warning(
+                            "pre_tool_use hook for %s returned non-object JSON; ignoring modified args",
+                            function_name,
+                        )
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "pre_tool_use hook for %s returned invalid JSON; ignoring modified args",
+                        function_name,
+                    )
+
             # Checkpoint for file-mutating tools
-            if function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
+            if should_execute and function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
                 try:
                     file_path = function_args.get("path", "")
                     if file_path:
@@ -6175,7 +6201,7 @@ class AIAgent(RuntimeBackend):
                     pass
 
             # Checkpoint before destructive terminal commands
-            if function_name == "terminal" and self._checkpoint_mgr.enabled:
+            if should_execute and function_name == "terminal" and self._checkpoint_mgr.enabled:
                 try:
                     cmd = function_args.get("command", "")
                     if _is_destructive_command(cmd):
@@ -6186,13 +6212,13 @@ class AIAgent(RuntimeBackend):
                 except Exception:
                     pass
 
-            parsed_calls.append((tool_call, function_name, function_args))
+            parsed_calls.append((tool_call, function_name, function_args, should_execute, cancel_reason))
 
         # ── Logging / callbacks ──────────────────────────────────────────
-        tool_names_str = ", ".join(name for _, name, _ in parsed_calls)
+        tool_names_str = ", ".join(name for _, name, _, _, _ in parsed_calls)
         if not self.quiet_mode:
             print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
-            for i, (tc, name, args) in enumerate(parsed_calls, 1):
+            for i, (tc, name, args, should_execute, cancel_reason) in enumerate(parsed_calls, 1):
                 args_str = json.dumps(args, ensure_ascii=False)
                 if self.verbose_logging:
                     print(f"  📞 Tool {i}: {name}({list(args.keys())})")
@@ -6200,8 +6226,12 @@ class AIAgent(RuntimeBackend):
                 else:
                     args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
                     print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
+                if not should_execute:
+                    print(f"     ⚠️  pre-hook cancelled execution: {cancel_reason}")
 
-        for tc, name, args in parsed_calls:
+        for tc, name, args, should_execute, _cancel_reason in parsed_calls:
+            if not should_execute:
+                continue
             if self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(name, args)
@@ -6209,7 +6239,9 @@ class AIAgent(RuntimeBackend):
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
-        for tc, name, args in parsed_calls:
+        for tc, name, args, should_execute, _cancel_reason in parsed_calls:
+            if not should_execute:
+                continue
             if self.tool_start_callback:
                 try:
                     self.tool_start_callback(tc.id, name, args)
@@ -6220,15 +6252,22 @@ class AIAgent(RuntimeBackend):
         # Each slot holds (function_name, function_args, function_result, duration, error_flag)
         results = [None] * num_tools
 
-        def _run_tool(index, tool_call, function_name, function_args):
+        def _run_tool(index, tool_call, function_name, function_args, should_execute, cancel_reason):
             """Worker function executed in a thread."""
             start = time.time()
-            try:
-                result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id)
-            except Exception as tool_error:
-                result = f"Error executing tool '{function_name}': {tool_error}"
-                logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
-            duration = time.time() - start
+            if not should_execute:
+                result = f"[Tool cancelled by hook: {cancel_reason}]"
+                duration = 0.0
+                is_error = True
+            else:
+                try:
+                    result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id)
+                except Exception as tool_error:
+                    result = f"Error executing tool '{function_name}': {tool_error}"
+                    logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
+                duration = time.time() - start
+                is_error, _ = _detect_tool_failure(function_name, result)
+            result = self._hook_runner.run_post(function_name, result, is_error, tool_call.id)
             is_error, _ = _detect_tool_failure(function_name, result)
             if is_error:
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
@@ -6247,8 +6286,8 @@ class AIAgent(RuntimeBackend):
             max_workers = min(num_tools, _MAX_TOOL_WORKERS)
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = []
-                for i, (tc, name, args) in enumerate(parsed_calls):
-                    f = executor.submit(_run_tool, i, tc, name, args)
+                for i, (tc, name, args, should_execute, cancel_reason) in enumerate(parsed_calls):
+                    f = executor.submit(_run_tool, i, tc, name, args, should_execute, cancel_reason)
                     futures.append(f)
 
                 # Wait for all to complete (exceptions are captured inside _run_tool)
@@ -6261,7 +6300,7 @@ class AIAgent(RuntimeBackend):
                 spinner.stop(f"⚡ {completed}/{num_tools} tools completed in {total_dur:.1f}s total")
 
         # ── Post-execution: display per-tool results ─────────────────────
-        for i, (tc, name, args) in enumerate(parsed_calls):
+        for i, (tc, name, args, _should_execute, _cancel_reason) in enumerate(parsed_calls):
             r = results[i]
             if r is None:
                 # Shouldn't happen, but safety fallback
@@ -6378,6 +6417,25 @@ class AIAgent(RuntimeBackend):
             if not isinstance(function_args, dict):
                 function_args = {}
 
+            args_json = json.dumps(function_args, ensure_ascii=False)
+            pre_result = self._hook_runner.run_pre(function_name, args_json, tool_call.id)
+            should_execute = pre_result.should_execute
+            if should_execute and pre_result.arguments != args_json:
+                try:
+                    modified_args = json.loads(pre_result.arguments)
+                    if isinstance(modified_args, dict):
+                        function_args = modified_args
+                    else:
+                        logger.warning(
+                            "pre_tool_use hook for %s returned non-object JSON; ignoring modified args",
+                            function_name,
+                        )
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "pre_tool_use hook for %s returned invalid JSON; ignoring modified args",
+                        function_name,
+                    )
+
             if not self.quiet_mode:
                 args_str = json.dumps(function_args, ensure_ascii=False)
                 if self.verbose_logging:
@@ -6386,25 +6444,27 @@ class AIAgent(RuntimeBackend):
                 else:
                     args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
                     print(f"  📞 Tool {i}: {function_name}({list(function_args.keys())}) - {args_preview}")
+                if not should_execute:
+                    print(f"     ⚠️  pre-hook cancelled execution: {pre_result.cancel_reason}")
 
             self._current_tool = function_name
             self._touch_activity(f"executing tool: {function_name}")
 
-            if self.tool_progress_callback:
+            if should_execute and self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(function_name, function_args)
                     self.tool_progress_callback("tool.started", function_name, preview, function_args)
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
-            if self.tool_start_callback:
+            if should_execute and self.tool_start_callback:
                 try:
                     self.tool_start_callback(tool_call.id, function_name, function_args)
                 except Exception as cb_err:
                     logging.debug(f"Tool start callback error: {cb_err}")
 
             # Checkpoint: snapshot working dir before file-mutating tools
-            if function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
+            if should_execute and function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
                 try:
                     file_path = function_args.get("path", "")
                     if file_path:
@@ -6416,7 +6476,7 @@ class AIAgent(RuntimeBackend):
                     pass  # never block tool execution
 
             # Checkpoint before destructive terminal commands
-            if function_name == "terminal" and self._checkpoint_mgr.enabled:
+            if should_execute and function_name == "terminal" and self._checkpoint_mgr.enabled:
                 try:
                     cmd = function_args.get("command", "")
                     if _is_destructive_command(cmd):
@@ -6429,7 +6489,10 @@ class AIAgent(RuntimeBackend):
 
             tool_start_time = time.time()
 
-            if function_name == "todo":
+            if not should_execute:
+                function_result = f"[Tool cancelled by hook: {pre_result.cancel_reason}]"
+                tool_duration = 0.0
+            elif function_name == "todo":
                 from tools.todo_tool import todo_tool as _todo_tool
                 function_result = _todo_tool(
                     todos=function_args.get("todos"),
@@ -6574,13 +6637,16 @@ class AIAgent(RuntimeBackend):
                     logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
                 tool_duration = time.time() - tool_start_time
 
-            result_preview = function_result if self.verbose_logging else (
-                function_result[:200] if len(function_result) > 200 else function_result
-            )
-
             # Log tool errors to the persistent error log so [error] tags
             # in the UI always have a corresponding detailed entry on disk.
             _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+            function_result = self._hook_runner.run_post(
+                function_name, function_result, _is_error_result, tool_call.id
+            )
+            _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+            result_preview = function_result if self.verbose_logging else (
+                function_result[:200] if len(function_result) > 200 else function_result
+            )
             if _is_error_result:
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
             else:
