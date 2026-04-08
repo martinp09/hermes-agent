@@ -7106,16 +7106,27 @@ class GatewayRunner:
             # Default 1800s (30 min inactivity).  0 = unlimited.
             _agent_timeout_raw = float(os.getenv("HERMES_AGENT_TIMEOUT", 1800))
             _agent_timeout = _agent_timeout_raw if _agent_timeout_raw > 0 else None
+
+            # Wall-clock hard limit: kills the agent after a maximum total
+            # runtime regardless of activity.  Prevents runaway sessions that
+            # keep touching activity but spin forever (e.g. LOB API hang).
+            # Config: HERMES_AGENT_WALL_CLOCK_LIMIT env var.
+            # Default 3600s (60 min).  0 = unlimited.
+            _wall_clock_limit_raw = float(os.getenv("HERMES_AGENT_WALL_CLOCK_LIMIT", 3600))
+            _wall_clock_limit = _wall_clock_limit_raw if _wall_clock_limit_raw > 0 else None
+            _wall_clock_start = time.time()
+
             loop = asyncio.get_event_loop()
             _executor_task = asyncio.ensure_future(
                 loop.run_in_executor(None, run_sync)
             )
 
             _inactivity_timeout = False
+            _wall_clock_timeout = False
             _POLL_INTERVAL = 5.0
 
-            if _agent_timeout is None:
-                # Unlimited — just await the result.
+            if _agent_timeout is None and _wall_clock_limit is None:
+                # No limits — just await the result.
                 response = await _executor_task
             else:
                 # Poll loop: check the agent's built-in activity tracker
@@ -7129,7 +7140,7 @@ class GatewayRunner:
                     if done:
                         response = _executor_task.result()
                         break
-                    # Agent still running — check inactivity.
+                    # Agent still running — check inactivity and wall-clock.
                     _agent_ref = agent_holder[0]
                     _idle_secs = 0.0
                     if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
@@ -7138,9 +7149,14 @@ class GatewayRunner:
                             _idle_secs = _act.get("seconds_since_activity", 0.0)
                         except Exception:
                             pass
-                    if _idle_secs >= _agent_timeout:
+                    if _agent_timeout is not None and _idle_secs >= _agent_timeout:
                         _inactivity_timeout = True
                         break
+                    if _wall_clock_limit is not None:
+                        _wall_elapsed = time.time() - _wall_clock_start
+                        if _wall_elapsed >= _wall_clock_limit:
+                            _wall_clock_timeout = True
+                            break
 
             if _inactivity_timeout:
                 # Build a diagnostic summary from the agent's activity tracker.
@@ -7192,6 +7208,65 @@ class GatewayRunner:
                     )
                 _diag_lines.append(
                     "To increase the limit, set agent.gateway_timeout in config.yaml "
+                    "(value in seconds, 0 = no limit) and restart the gateway.\n"
+                    "Try again, or use /reset to start fresh."
+                )
+
+                response = {
+                    "final_response": "\n".join(_diag_lines),
+                    "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
+                    "api_calls": _iter_n,
+                    "tools": tools_holder[0] or [],
+                    "history_offset": 0,
+                    "failed": True,
+                }
+
+            elif _wall_clock_timeout:
+                # Wall-clock timeout: build diagnostics from activity tracker.
+                _timed_out_agent = agent_holder[0]
+                _activity = {}
+                if _timed_out_agent and hasattr(_timed_out_agent, "get_activity_summary"):
+                    try:
+                        _activity = _timed_out_agent.get_activity_summary()
+                    except Exception:
+                        pass
+
+                _last_desc = _activity.get("last_activity_desc", "unknown")
+                _secs_ago = _activity.get("seconds_since_activity", 0)
+                _cur_tool = _activity.get("current_tool")
+                _iter_n = _activity.get("api_call_count", 0)
+                _iter_max = _activity.get("max_iterations", 0)
+
+                logger.error(
+                    "Agent hit %.0fs wall-clock limit (%.0fs elapsed) in session %s "
+                    "| last_activity=%s | iteration=%s/%s | tool=%s",
+                    _wall_clock_limit, time.time() - _wall_clock_start, session_key,
+                    _last_desc, _iter_n, _iter_max,
+                    _cur_tool or "none",
+                )
+
+                # Interrupt the agent if it's still running so the thread
+                # pool worker is freed.
+                if _timed_out_agent and hasattr(_timed_out_agent, "interrupt"):
+                    _timed_out_agent.interrupt("Execution timed out (wall-clock limit)")
+
+                _timeout_mins = int(_wall_clock_limit // 60) or 1
+
+                _diag_lines = [
+                    f"⏱️ Agent hit the {_timeout_mins} min wall-clock limit."
+                ]
+                if _cur_tool:
+                    _diag_lines.append(
+                        f"Last tool: `{_cur_tool}` ({_secs_ago:.0f}s since activity, "
+                        f"iteration {_iter_n}/{_iter_max})."
+                    )
+                else:
+                    _diag_lines.append(
+                        f"Last activity: {_last_desc} ({_secs_ago:.0f}s ago, "
+                        f"iteration {_iter_n}/{_iter_max})."
+                    )
+                _diag_lines.append(
+                    "To increase the limit, set HERMES_AGENT_WALL_CLOCK_LIMIT in .env "
                     "(value in seconds, 0 = no limit) and restart the gateway.\n"
                     "Try again, or use /reset to start fresh."
                 )

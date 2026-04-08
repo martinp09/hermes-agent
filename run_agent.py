@@ -22,6 +22,7 @@ Usage:
 
 import asyncio
 import base64
+import collections
 import concurrent.futures
 import copy
 import hashlib
@@ -6062,6 +6063,37 @@ class AIAgent:
             if not isinstance(function_args, dict):
                 function_args = {}
 
+            # Loop detection: track tool call signatures across iterations.
+            # For concurrent batches, check all signatures before executing any.
+            _sig = (function_name, json.dumps(sorted(function_args.items()), sort_keys=True))
+            self._recent_tool_call_signatures.append(_sig)
+            _sig_count = sum(1 for s in self._recent_tool_call_signatures if s == _sig)
+            if _sig_count >= 3:
+                _loop_msg = (
+                    f"Loop detected: tool '{function_name}' called with "
+                    f"identical arguments {_sig_count} times. "
+                    f"Stopping to prevent infinite loop. "
+                    f"Please try a different approach or use different arguments."
+                )
+                self._vprint(f"{self.log_prefix}🔄 {_loop_msg}", force=True)
+                logging.warning("Loop detection triggered: %s (count=%d)", function_name, _sig_count)
+                self.interrupt(_loop_msg)
+                # Append tool results for ALL tools in batch so the model sees what happened
+                for tc in assistant_message.tool_calls:
+                    if tc.id == tool_call.id:
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": f"[STOPPED] {_loop_msg}",
+                        })
+                    else:
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": "[Skipped: loop detection triggered, agent interrupted]",
+                        })
+                return  # Skip entire concurrent batch
+
             # Checkpoint for file-mutating tools
             if function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
                 try:
@@ -6283,6 +6315,38 @@ class AIAgent:
                 function_args = {}
             if not isinstance(function_args, dict):
                 function_args = {}
+
+            # Loop detection: track tool call signatures across iterations.
+            # If the same (tool_name, args_hash) combo appears 3+ times in
+            # the recent window, interrupt the agent to prevent runaway loops.
+            _sig = (function_name, json.dumps(sorted(function_args.items()), sort_keys=True))
+            self._recent_tool_call_signatures.append(_sig)
+            _sig_count = sum(1 for s in self._recent_tool_call_signatures if s == _sig)
+            if _sig_count >= 3:
+                _loop_msg = (
+                    f"Loop detected: tool '{function_name}' called with "
+                    f"identical arguments {_sig_count} times. "
+                    f"Stopping to prevent infinite loop. "
+                    f"Please try a different approach or use different arguments."
+                )
+                self._vprint(f"{self.log_prefix}🔄 {_loop_msg}", force=True)
+                logging.warning("Loop detection triggered: %s (count=%d)", function_name, _sig_count)
+                self.interrupt(_loop_msg)
+                # Append tool result so the model sees what happened
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": f"[STOPPED] {_loop_msg}",
+                })
+                # Skip remaining tool calls
+                remaining = assistant_message.tool_calls[i:]
+                for skipped_tc in remaining:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": skipped_tc.id,
+                        "content": "[Skipped: loop detection triggered, agent interrupted]",
+                    })
+                break
 
             if not self.quiet_mode:
                 args_str = json.dumps(function_args, ensure_ascii=False)
@@ -6859,6 +6923,9 @@ class AIAgent:
         self._thinking_prefill_retries = 0
         self._last_content_with_tools = None
         self._mute_post_response = False
+        # Loop detection: track recent tool call signatures across iterations.
+        # If the same (tool_name, args) combo repeats 3+ times, we interrupt.
+        self._recent_tool_call_signatures = collections.deque(maxlen=20)
         self._surrogate_sanitized = False
 
         # Pre-turn connection health check: detect and clean up dead TCP
