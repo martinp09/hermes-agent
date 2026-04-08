@@ -515,6 +515,7 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
+    profile: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -523,6 +524,10 @@ def delegate_task(
     Supports two modes:
       - Single: provide goal (+ optional context, toolsets)
       - Batch:  provide tasks array [{goal, context, toolsets}, ...]
+
+    When ``profile`` is set (e.g. "qc", "coder"), the delegation config is
+    loaded from ~/.hermes/profiles/{name}/config.yaml instead of the main
+    config, letting you route subagents to any profile's model/provider.
 
     Returns JSON with results array, one entry per task.
     """
@@ -539,8 +544,8 @@ def delegate_task(
             )
         })
 
-    # Load config
-    cfg = _load_config()
+    # Load config (from profile or main config)
+    cfg = _load_config(profile=profile)
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     effective_max_iter = max_iterations or default_max_iter
 
@@ -812,14 +817,62 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     }
 
 
-def _load_config() -> dict:
-    """Load delegation config from CLI_CONFIG or persistent config.
+def _load_profile_config(profile_name: str) -> dict:
+    """Load delegation config from a named profile's config.yaml.
 
-    Checks the runtime config (cli.py CLI_CONFIG) first, then falls back
+    Profiles live at ~/.hermes/profiles/{name}/config.yaml.
+    Returns the delegation: section if present, otherwise falls back to
+    top-level model/provider/base_url keys (treating the whole profile
+    config as a delegation source).
+    """
+    import yaml
+    profile_path = os.path.expanduser(f"~/.hermes/profiles/{profile_name}/config.yaml")
+    if not os.path.isfile(profile_path):
+        raise ValueError(
+            f"Profile '{profile_name}' not found at {profile_path}. "
+            f"Available profiles: {', '.join(_list_profiles()) or 'none'}"
+        )
+    with open(profile_path) as f:
+        full = yaml.safe_load(f) or {}
+    # Prefer explicit delegation: section, fall back to top-level model/provider
+    delegation = full.get("delegation", {})
+    if not delegation.get("model") and not delegation.get("provider"):
+        # Fall back to profile's top-level model/provider config
+        model_cfg = full.get("model", {})
+        if isinstance(model_cfg, dict):
+            delegation = {
+                "model": model_cfg.get("default", ""),
+                "provider": model_cfg.get("provider", ""),
+                "base_url": model_cfg.get("base_url", ""),
+                **delegation,
+            }
+        elif isinstance(model_cfg, str) and model_cfg:
+            delegation = {"model": model_cfg, **delegation}
+    return delegation
+
+
+def _list_profiles() -> list:
+    """List available profile names."""
+    profiles_dir = os.path.expanduser("~/.hermes/profiles")
+    if not os.path.isdir(profiles_dir):
+        return []
+    return [
+        d for d in os.listdir(profiles_dir)
+        if os.path.isfile(os.path.join(profiles_dir, d, "config.yaml"))
+    ]
+
+
+def _load_config(profile: Optional[str] = None) -> dict:
+    """Load delegation config from CLI_CONFIG, a named profile, or persistent config.
+
+    When ``profile`` is specified, loads from ~/.hermes/profiles/{name}/config.yaml.
+    Otherwise checks the runtime config (cli.py CLI_CONFIG) first, then falls back
     to the persistent config (hermes_cli/config.py load_config()) so that
     ``delegation.model`` / ``delegation.provider`` are picked up regardless
     of the entry point (CLI, gateway, cron).
     """
+    if profile:
+        return _load_profile_config(profile)
     try:
         from cli import CLI_CONFIG
         cfg = CLI_CONFIG.get("delegation", {})
@@ -951,6 +1004,15 @@ DELEGATE_TASK_SCHEMA = {
                     "Only used when acp_command is set. Example: ['--acp', '--stdio', '--model', 'claude-opus-4-6']"
                 ),
             },
+            "profile": {
+                "type": "string",
+                "description": (
+                    "Load delegation config from a named profile (e.g. 'qc', 'coder'). "
+                    "Reads ~/.hermes/profiles/{name}/config.yaml and uses its delegation: "
+                    "section (or top-level model/provider) instead of the main config. "
+                    "This lets you route subagents to any profile's model/provider pair."
+                ),
+            },
         },
         "required": [],
     },
@@ -972,6 +1034,7 @@ registry.register(
         max_iterations=args.get("max_iterations"),
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
+        profile=args.get("profile"),
         parent_agent=kw.get("parent_agent")),
     check_fn=check_delegate_requirements,
     emoji="🔀",
