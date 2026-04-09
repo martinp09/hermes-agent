@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import threading
+import concurrent.futures
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -25,6 +26,7 @@ from tools.delegate_tool import (
     delegate_task,
     _build_child_agent,
     _build_child_system_prompt,
+    _run_single_child,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
@@ -563,6 +565,39 @@ class TestBlockedTools(unittest.TestCase):
     def test_constants(self):
         self.assertEqual(MAX_CONCURRENT_CHILDREN, 3)
         self.assertEqual(MAX_DEPTH, 2)
+
+
+class TestDelegateTimeouts(unittest.TestCase):
+    def test_run_single_child_timeout_returns_immediately(self):
+        child = MagicMock()
+        child.tool_progress_callback = None
+
+        class _FakeFuture:
+            def result(self, timeout=None):
+                raise concurrent.futures.TimeoutError()
+
+            def cancel(self):
+                return True
+
+        class _FakePool:
+            def __init__(self, *args, **kwargs):
+                self.shutdown_calls = []
+
+            def submit(self, fn, **kwargs):
+                return _FakeFuture()
+
+            def shutdown(self, wait=True, cancel_futures=False):
+                self.shutdown_calls.append((wait, cancel_futures))
+
+        fake_pool = _FakePool()
+
+        with patch("tools.delegate_tool.ThreadPoolExecutor", return_value=fake_pool):
+            result = _run_single_child(0, "Investigate", child=child, timeout=1)
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("timed out", result["error"].lower())
+        child.interrupt.assert_called_once()
+        self.assertEqual(fake_pool.shutdown_calls, [(False, True)])
 
 
 class TestDelegationCredentialResolution(unittest.TestCase):

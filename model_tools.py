@@ -108,9 +108,23 @@ def _run_async(coro):
     if loop and loop.is_running():
         # Inside an async context (gateway, RL env) — run in a fresh thread.
         import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        timed_out = False
+        try:
             future = pool.submit(asyncio.run, coro)
             return future.result(timeout=300)
+        except concurrent.futures.TimeoutError:
+            # Coroutine timed out — try to cancel it from the child thread.
+            # The thread may still be blocked in asyncio.run(), so we
+            # shutdown(wait=False) to abandon it rather than block forever.
+            logger.warning("_run_async timed out after 300s — abandoning coroutine thread")
+            timed_out = True
+            future.cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise TimeoutError("Async tool call timed out after 300s")
+        finally:
+            if not timed_out:
+                pool.shutdown(wait=True, cancel_futures=False)
 
     # If we're on a worker thread (e.g., parallel tool execution in
     # delegate_task), use a per-thread persistent loop.  This avoids

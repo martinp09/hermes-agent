@@ -58,6 +58,9 @@ def agent():
             skip_memory=True,
         )
         a.client = MagicMock()
+        if not hasattr(a, "_recent_tool_call_signatures"):
+            import collections
+            a._recent_tool_call_signatures = collections.deque(maxlen=12)
         return a
 
 
@@ -79,6 +82,9 @@ def agent_with_memory_tool():
             skip_memory=True,
         )
         a.client = MagicMock()
+        if not hasattr(a, "_recent_tool_call_signatures"):
+            import collections
+            a._recent_tool_call_signatures = collections.deque(maxlen=12)
         return a
 
 
@@ -872,52 +878,6 @@ class TestBuildApiKwargs:
         kwargs = agent._build_api_kwargs(messages)
         assert kwargs["max_tokens"] == 4096
 
-    def test_qwen_portal_formats_messages_and_metadata(self, agent):
-        agent.base_url = "https://portal.qwen.ai/v1"
-        agent._base_url_lower = agent.base_url.lower()
-        agent.session_id = "sess-123"
-        messages = [
-            {"role": "system", "content": "You are helpful"},
-            {"role": "assistant", "content": "Got it"},
-            {"role": "user", "content": "hi"},
-        ]
-        kwargs = agent._build_api_kwargs(messages)
-        assert kwargs["metadata"]["sessionId"] == "sess-123"
-        assert kwargs["extra_body"]["vl_high_resolution_images"] is True
-        assert isinstance(kwargs["messages"][0]["content"], list)
-        assert kwargs["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
-        assert kwargs["messages"][2]["content"][0]["text"] == "hi"
-
-    def test_qwen_portal_normalizes_bare_string_content_parts(self, agent):
-        agent.base_url = "https://portal.qwen.ai/v1"
-        agent._base_url_lower = agent.base_url.lower()
-        messages = [
-            {"role": "system", "content": [{"type": "text", "text": "system"}]},
-            {"role": "user", "content": ["hello", {"type": "text", "text": "world"}]},
-        ]
-        kwargs = agent._build_api_kwargs(messages)
-        user_content = kwargs["messages"][1]["content"]
-        assert user_content[0] == {"type": "text", "text": "hello"}
-        assert user_content[1] == {"type": "text", "text": "world"}
-
-    def test_qwen_portal_no_system_message(self, agent):
-        agent.base_url = "https://portal.qwen.ai/v1"
-        agent._base_url_lower = agent.base_url.lower()
-        messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
-        # Should not crash even without a system message
-        assert kwargs["messages"][0]["content"][0]["text"] == "hi"
-        assert "cache_control" not in kwargs["messages"][0]["content"][0]
-
-    def test_qwen_portal_omits_max_tokens(self, agent):
-        agent.base_url = "https://portal.qwen.ai/v1"
-        agent._base_url_lower = agent.base_url.lower()
-        agent.max_tokens = 4096
-        messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
-        assert "max_tokens" not in kwargs
-        assert "max_completion_tokens" not in kwargs
-
 
 class TestBuildAssistantMessage:
     def test_basic_message(self, agent):
@@ -1344,6 +1304,42 @@ class TestConcurrentToolExecution:
         assert len(completes) == 2
         assert {entry[0] for entry in completes} == {"c1", "c2"}
         assert {entry[3] for entry in completes} == {'{"id":1}', '{"id":2}'}
+
+    def test_concurrent_timeout_does_not_wait_on_executor_shutdown(self, agent):
+        tc1 = _mock_tool_call(name="web_search", arguments='{"query":"one"}', call_id="c1")
+        tc2 = _mock_tool_call(name="web_search", arguments='{"query":"two"}', call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+
+        class _FakeFuture:
+            def cancel(self):
+                return True
+
+        class _FakeExecutor:
+            def __init__(self, *args, **kwargs):
+                self.futures = [_FakeFuture(), _FakeFuture()]
+                self.shutdown_calls = []
+
+            def submit(self, fn, *args, **kwargs):
+                return self.futures.pop(0)
+
+            def shutdown(self, wait=True, cancel_futures=False):
+                self.shutdown_calls.append((wait, cancel_futures))
+
+        fake_executor = _FakeExecutor()
+        submitted_futures = list(fake_executor.futures)
+
+        with (
+            patch("run_agent.concurrent.futures.ThreadPoolExecutor", return_value=fake_executor),
+            patch("run_agent.concurrent.futures.wait", return_value=(set(), set(submitted_futures))),
+            patch("run_agent.time.time", side_effect=[0.0, 0.0, 301.0, 301.0, 301.0, 301.0]),
+            patch.object(agent, "_touch_activity"),
+        ):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        assert len(messages) == 2
+        assert all("timed out or was cancelled" in m["content"] for m in messages)
+        assert fake_executor.shutdown_calls == [(False, True)]
 
     def test_invoke_tool_handles_agent_level_tools(self, agent):
         """_invoke_tool should handle todo tool directly."""

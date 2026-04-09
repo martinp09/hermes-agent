@@ -11,6 +11,7 @@ The fix replaces asyncio.run() with a persistent event loop in _run_async().
 """
 
 import asyncio
+import concurrent.futures
 import json
 import threading
 from types import SimpleNamespace
@@ -196,6 +197,46 @@ class TestRunAsyncWithRunningLoop:
             None, _run_async, _simple()
         )
         assert result == 42
+
+    def test_timeout_does_not_block_on_executor_shutdown(self):
+        """Timeout path must not re-block in shutdown(wait=True)."""
+        from model_tools import _run_async
+
+        class _RunningLoop:
+            def is_running(self):
+                return True
+
+        class _FakeFuture:
+            def result(self, timeout=None):
+                raise concurrent.futures.TimeoutError()
+
+            def cancel(self):
+                return True
+
+        class _FakePool:
+            def __init__(self, *args, **kwargs):
+                self.shutdown_calls = []
+
+            def submit(self, fn, coro):
+                return _FakeFuture()
+
+            def shutdown(self, wait=True, cancel_futures=False):
+                self.shutdown_calls.append((wait, cancel_futures))
+
+        fake_pool = _FakePool()
+
+        coro = _get_current_loop()
+        try:
+            with (
+                patch("model_tools.asyncio.get_running_loop", return_value=_RunningLoop()),
+                patch("concurrent.futures.ThreadPoolExecutor", return_value=fake_pool),
+            ):
+                with pytest.raises(TimeoutError, match="timed out"):
+                    _run_async(coro)
+        finally:
+            coro.close()
+
+        assert fake_pool.shutdown_calls == [(False, True)]
 
 
 # ---------------------------------------------------------------------------

@@ -6238,6 +6238,8 @@ class AIAgent:
         # ── Concurrent execution ─────────────────────────────────────────
         # Each slot holds (function_name, function_args, function_result, duration, error_flag)
         results = [None] * num_tools
+        results_lock = threading.Lock()
+        timed_out_indexes = set()
 
         def _run_tool(index, tool_call, function_name, function_args):
             """Worker function executed in a thread."""
@@ -6253,7 +6255,10 @@ class AIAgent:
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
-            results[index] = (function_name, function_args, result, duration, is_error)
+            with results_lock:
+                if index in timed_out_indexes:
+                    return
+                results[index] = (function_name, function_args, result, duration, is_error)
 
         # Start spinner for CLI mode (skip when TUI handles tool progress)
         spinner = None
@@ -6264,14 +6269,43 @@ class AIAgent:
 
         try:
             max_workers = min(num_tools, _MAX_TOOL_WORKERS)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = []
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+            futures = []
+            future_to_index = {}
+            timed_out = False
+            try:
                 for i, (tc, name, args) in enumerate(parsed_calls):
                     f = executor.submit(_run_tool, i, tc, name, args)
                     futures.append(f)
+                    future_to_index[f] = i
 
-                # Wait for all to complete (exceptions are captured inside _run_tool)
-                concurrent.futures.wait(futures)
+                _PER_TOOL_TIMEOUT = 300
+                _batch_deadline = time.time() + _PER_TOOL_TIMEOUT
+                remaining = set(futures)
+                while remaining:
+                    _now = time.time()
+                    _wait_time = max(_batch_deadline - _now, 0)
+                    if _wait_time <= 0:
+                        logger.warning(
+                            "Concurrent tool batch timed out after %ds — %d tool(s) still running",
+                            _PER_TOOL_TIMEOUT,
+                            len(remaining),
+                        )
+                        break
+                    done, remaining = concurrent.futures.wait(
+                        remaining,
+                        timeout=min(_wait_time, 5.0),
+                    )
+
+                for f in remaining:
+                    timed_out = True
+                    timed_out_indexes.add(future_to_index[f])
+                    f.cancel()
+            finally:
+                if timed_out:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                else:
+                    executor.shutdown(wait=True, cancel_futures=False)
         finally:
             if spinner:
                 # Build a summary message for the spinner stop
@@ -6283,8 +6317,7 @@ class AIAgent:
         for i, (tc, name, args) in enumerate(parsed_calls):
             r = results[i]
             if r is None:
-                # Shouldn't happen, but safety fallback
-                function_result = f"Error executing tool '{name}': thread did not return a result"
+                function_result = f"Error executing tool '{name}': tool execution timed out or was cancelled"
                 tool_duration = 0.0
             else:
                 function_name, function_args, function_result, tool_duration, is_error = r

@@ -16,6 +16,7 @@ The parent's context only sees the delegation call and the summary result,
 never the child's intermediate tool calls or reasoning.
 """
 
+import concurrent.futures
 import json
 import logging
 logger = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ MAX_CONCURRENT_CHILDREN = 3
 MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
 DEFAULT_MAX_ITERATIONS = 50
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
+DEFAULT_CHILD_TIMEOUT_SECONDS = 900  # 15 min hard cap per subagent
 
 
 def check_delegate_requirements() -> bool:
@@ -340,6 +342,7 @@ def _run_single_child(
     goal: str,
     child=None,
     parent_agent=None,
+    timeout: Optional[int] = None,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -347,6 +350,7 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    child_timeout = timeout or DEFAULT_CHILD_TIMEOUT_SECONDS
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, 'tool_progress_callback', None)
@@ -370,7 +374,36 @@ def _run_single_child(
                 logger.debug("Failed to bind child to leased credential: %s", exc)
 
     try:
-        result = child.run_conversation(user_message=goal)
+        _child_pool = ThreadPoolExecutor(max_workers=1)
+        timed_out = False
+        try:
+            _future = _child_pool.submit(child.run_conversation, user_message=goal)
+            try:
+                result = _future.result(timeout=child_timeout)
+            except concurrent.futures.TimeoutError:
+                timed_out = True
+                logger.warning(
+                    "[subagent-%d] timed out after %ds — interrupting",
+                    task_index,
+                    child_timeout,
+                )
+                try:
+                    child.interrupt()
+                except Exception:
+                    pass
+                _future.cancel()
+                _child_pool.shutdown(wait=False, cancel_futures=True)
+                return {
+                    "task_index": task_index,
+                    "status": "error",
+                    "summary": None,
+                    "error": f"Subagent timed out after {child_timeout}s",
+                    "api_calls": 0,
+                    "duration_seconds": round(time.monotonic() - child_start, 2),
+                }
+        finally:
+            if not timed_out:
+                _child_pool.shutdown(wait=True, cancel_futures=False)
 
         # Flush any remaining batched progress to gateway
         if child_progress_cb and hasattr(child_progress_cb, '_flush'):
@@ -543,6 +576,7 @@ def delegate_task(
     cfg = _load_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     effective_max_iter = max_iterations or default_max_iter
+    effective_timeout = cfg.get("timeout", DEFAULT_CHILD_TIMEOUT_SECONDS)
 
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
@@ -609,7 +643,7 @@ def delegate_task(
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
         _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
+        result = _run_single_child(0, _t["goal"], child, parent_agent, timeout=effective_timeout)
         results.append(result)
     else:
         # Batch -- run in parallel with per-task progress lines
@@ -625,12 +659,13 @@ def delegate_task(
                     goal=t["goal"],
                     child=child,
                     parent_agent=parent_agent,
+                    timeout=effective_timeout,
                 )
                 futures[future] = i
 
             for future in as_completed(futures):
                 try:
-                    entry = future.result()
+                    entry = future.result(timeout=effective_timeout + 30)
                 except Exception as exc:
                     idx = futures[future]
                     entry = {
@@ -744,8 +779,18 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
 
     if configured_base_url:
+        parent_api_key = getattr(parent_agent, "api_key", None)
+        if not parent_api_key and hasattr(parent_agent, "_client_kwargs"):
+            parent_api_key = parent_agent._client_kwargs.get("api_key")
+        parent_base_url = str(getattr(parent_agent, "base_url", "") or "").strip()
+        inherit_parent_key = bool(
+            parent_api_key
+            and parent_base_url
+            and parent_base_url.rstrip("/") == configured_base_url.rstrip("/")
+        )
         api_key = (
             configured_api_key
+            or (parent_api_key if inherit_parent_key else None)
             or os.getenv("OPENAI_API_KEY", "").strip()
         )
         if not api_key:
