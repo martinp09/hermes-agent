@@ -44,6 +44,9 @@ from tools.code_execution_tool import (
     build_execute_code_schema,
     EXECUTE_CODE_SCHEMA,
     _TOOL_DOC_LINES,
+    DEFAULT_TIMEOUT,
+    DEFAULT_MAX_TOOL_CALLS,
+    _resolve_execution_limits,
 )
 
 
@@ -236,6 +239,18 @@ raise RuntimeError("deliberate crash")
                 ))
         self.assertEqual(result["status"], "timeout")
         self.assertIn("timed out", result.get("error", ""))
+
+    def test_zero_timeout_config_uses_default_timeout(self):
+        """timeout=0 in config should not instantly kill normal scripts."""
+        with patch("model_tools.handle_function_call", side_effect=_mock_handle_function_call):
+            with patch("tools.code_execution_tool._load_config", return_value={"timeout": 0, "max_tool_calls": 50}):
+                result = json.loads(execute_code(
+                    code='print("still runs")',
+                    task_id="test-task",
+                    enabled_tools=list(SANDBOX_ALLOWED_TOOLS),
+                ))
+        self.assertEqual(result["status"], "success")
+        self.assertIn("still runs", result["output"])
 
     def test_web_search_tool(self):
         """Script calls web_search and processes results."""
@@ -728,6 +743,33 @@ class TestLoadConfig(unittest.TestCase):
         with patch.dict("sys.modules", {"cli": mock_cli}):
             result = _load_config()
         self.assertIsInstance(result, dict)
+
+    def test_resolve_execution_limits_zero_timeout_falls_back_to_default(self):
+        timeout, max_tool_calls = _resolve_execution_limits({"timeout": 0, "max_tool_calls": 7})
+        self.assertEqual(timeout, DEFAULT_TIMEOUT)
+        self.assertEqual(max_tool_calls, 7)
+
+    def test_resolve_execution_limits_preserves_short_positive_timeout(self):
+        timeout, max_tool_calls = _resolve_execution_limits({"timeout": 2, "max_tool_calls": 9})
+        self.assertEqual(timeout, 2)
+        self.assertEqual(max_tool_calls, 9)
+
+    def test_resolve_execution_limits_invalid_values_fall_back(self):
+        timeout, max_tool_calls = _resolve_execution_limits({"timeout": "bad", "max_tool_calls": 0})
+        self.assertEqual(timeout, DEFAULT_TIMEOUT)
+        self.assertEqual(max_tool_calls, DEFAULT_MAX_TOOL_CALLS)
+
+    def test_non_positive_runtime_limits_fall_back_to_defaults(self):
+        with patch("model_tools.handle_function_call", side_effect=_mock_handle_function_call), \
+             patch("tools.code_execution_tool._load_config",
+                   return_value={"timeout": 0, "max_tool_calls": 0}):
+            result = json.loads(execute_code(
+                code='print("hello world")',
+                task_id="test-zero-timeout",
+                enabled_tools=list(SANDBOX_ALLOWED_TOOLS),
+            ))
+        self.assertEqual(result["status"], "success")
+        self.assertIn("hello world", result["output"])
 
 
 # ---------------------------------------------------------------------------

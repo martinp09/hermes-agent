@@ -27,20 +27,34 @@ _approval_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_session_key",
     default="",
 )
+_approval_session_local = threading.local()
 
 
 def set_current_session_key(session_key: str) -> contextvars.Token[str]:
     """Bind the active approval session key to the current context."""
-    return _approval_session_key.set(session_key or "")
+    bound = session_key or ""
+    _approval_session_local.session_key = bound
+    return _approval_session_key.set(bound)
 
 
 def reset_current_session_key(token: contextvars.Token[str]) -> None:
     """Restore the prior approval session key context."""
     _approval_session_key.reset(token)
+    restored = _approval_session_key.get()
+    if restored:
+        _approval_session_local.session_key = restored
+    else:
+        try:
+            delattr(_approval_session_local, "session_key")
+        except AttributeError:
+            pass
 
 
 def get_current_session_key(default: str = "default") -> str:
-    """Return the active session key, preferring context-local state."""
+    """Return the active session key, preferring thread/context-local state."""
+    session_key = getattr(_approval_session_local, "session_key", "")
+    if session_key:
+        return session_key
     session_key = _approval_session_key.get()
     if session_key:
         return session_key

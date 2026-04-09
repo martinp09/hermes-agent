@@ -1,6 +1,9 @@
 """Tests for the dangerous command approval module."""
 
 import ast
+import os
+import threading
+import uuid
 from pathlib import Path
 from unittest.mock import patch as mock_patch
 
@@ -180,47 +183,47 @@ class TestSessionKeyContext:
         assert "reset_current_session_key" in called_names
 
     def test_context_keeps_pending_approval_attached_to_originating_session(self):
-        import os
-        import threading
+        with mock_patch.object(approval_module, "_get_approval_mode", return_value="on"):
+            alice_key = f"alice-{uuid.uuid4().hex[:8]}"
+            bob_key = f"bob-{uuid.uuid4().hex[:8]}"
+            clear_session(alice_key)
+            clear_session(bob_key)
+            pop_pending(alice_key)
+            pop_pending(bob_key)
+            approval_module._permanent_approved.clear()
 
-        clear_session("alice")
-        clear_session("bob")
-        pop_pending("alice")
-        pop_pending("bob")
-        approval_module._permanent_approved.clear()
+            alice_ready = threading.Event()
+            bob_ready = threading.Event()
 
-        alice_ready = threading.Event()
-        bob_ready = threading.Event()
+            def worker_alice():
+                token = approval_module.set_current_session_key(alice_key)
+                try:
+                    os.environ["HERMES_EXEC_ASK"] = "1"
+                    os.environ["HERMES_SESSION_KEY"] = alice_key
+                    alice_ready.set()
+                    bob_ready.wait()
+                    approval_module.check_all_command_guards("rm -rf /tmp/alice-secret", "local")
+                finally:
+                    approval_module.reset_current_session_key(token)
 
-        def worker_alice():
-            token = approval_module.set_current_session_key("alice")
-            try:
-                os.environ["HERMES_EXEC_ASK"] = "1"
-                os.environ["HERMES_SESSION_KEY"] = "alice"
-                alice_ready.set()
-                bob_ready.wait()
-                approval_module.check_all_command_guards("rm -rf /tmp/alice-secret", "local")
-            finally:
-                approval_module.reset_current_session_key(token)
+            def worker_bob():
+                alice_ready.wait()
+                token = approval_module.set_current_session_key(bob_key)
+                try:
+                    os.environ["HERMES_SESSION_KEY"] = bob_key
+                    bob_ready.set()
+                finally:
+                    approval_module.reset_current_session_key(token)
 
-        def worker_bob():
-            alice_ready.wait()
-            token = approval_module.set_current_session_key("bob")
-            try:
-                os.environ["HERMES_SESSION_KEY"] = "bob"
-                bob_ready.set()
-            finally:
-                approval_module.reset_current_session_key(token)
+            t1 = threading.Thread(target=worker_alice)
+            t2 = threading.Thread(target=worker_bob)
+            t1.start()
+            t2.start()
+            t1.join()
+            t2.join()
 
-        t1 = threading.Thread(target=worker_alice)
-        t2 = threading.Thread(target=worker_bob)
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
-
-        assert pop_pending("alice") is not None
-        assert pop_pending("bob") is None
+            assert pop_pending(alice_key) is not None
+            assert pop_pending(bob_key) is None
 
 
 class TestRmFalsePositiveFix:
@@ -714,5 +717,3 @@ class TestNormalizationBypass:
         cmd = "\uff4c\uff53 -\uff4c\uff41 /tmp"
         dangerous, key, desc = detect_dangerous_command(cmd)
         assert dangerous is False
-
-

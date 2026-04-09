@@ -2332,8 +2332,10 @@ class GatewayRunner:
         # Build session context
         context = build_session_context(source, self.config, session_entry)
         
-        # Set environment variables for tools
-        self._set_session_env(context)
+        # Set environment variables for tools.
+        # Keep a per-call backup token so overlapping handlers restore their
+        # own prior values instead of clobbering shared process state.
+        _session_env_backup = self._set_session_env(context)
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -3163,7 +3165,7 @@ class GatewayRunner:
             )
         finally:
             # Clear session env
-            self._clear_session_env()
+            self._clear_session_env(_session_env_backup)
     
     def _format_session_info(self) -> str:
         """Resolve current model config and return a formatted info block.
@@ -5908,20 +5910,46 @@ class GatewayRunner:
 
         return True
 
-    def _set_session_env(self, context: SessionContext) -> None:
+    def _set_session_env(self, context: SessionContext) -> Dict[str, Optional[str]]:
         """Set environment variables for the current session."""
+        session_vars = (
+            "HERMES_SESSION_PLATFORM",
+            "HERMES_SESSION_CHAT_ID",
+            "HERMES_SESSION_CHAT_NAME",
+            "HERMES_SESSION_THREAD_ID",
+        )
+        backup = {var: os.environ.get(var) for var in session_vars}
+
         os.environ["HERMES_SESSION_PLATFORM"] = context.source.platform.value
         os.environ["HERMES_SESSION_CHAT_ID"] = context.source.chat_id
         if context.source.chat_name:
             os.environ["HERMES_SESSION_CHAT_NAME"] = context.source.chat_name
+        else:
+            os.environ.pop("HERMES_SESSION_CHAT_NAME", None)
         if context.source.thread_id:
             os.environ["HERMES_SESSION_THREAD_ID"] = str(context.source.thread_id)
-    
-    def _clear_session_env(self) -> None:
-        """Clear session environment variables."""
-        for var in ["HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_CHAT_NAME", "HERMES_SESSION_THREAD_ID"]:
-            if var in os.environ:
-                del os.environ[var]
+        else:
+            os.environ.pop("HERMES_SESSION_THREAD_ID", None)
+        return backup
+
+    def _clear_session_env(self, backup: Optional[Dict[str, Optional[str]]] = None) -> None:
+        """Restore or clear session environment variables."""
+        session_vars = (
+            "HERMES_SESSION_PLATFORM",
+            "HERMES_SESSION_CHAT_ID",
+            "HERMES_SESSION_CHAT_NAME",
+            "HERMES_SESSION_THREAD_ID",
+        )
+        if backup is None:
+            for var in session_vars:
+                os.environ.pop(var, None)
+            return
+        for var in session_vars:
+            prev_value = backup.get(var)
+            if prev_value is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = prev_value
     
     async def _enrich_message_with_vision(
         self,

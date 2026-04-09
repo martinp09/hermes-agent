@@ -74,6 +74,25 @@ def check_sandbox_requirements() -> bool:
     return SANDBOX_AVAILABLE
 
 
+def _coerce_positive_int(value: Any, default: int) -> int:
+    """Parse a positive integer config value, falling back to a safe default."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _resolve_execution_limits(config: Optional[dict]) -> tuple[int, int]:
+    """Resolve timeout and max_tool_calls with sane fallbacks."""
+    config = config or {}
+    timeout = _coerce_positive_int(config.get("timeout"), DEFAULT_TIMEOUT)
+    max_tool_calls = _coerce_positive_int(
+        config.get("max_tool_calls"), DEFAULT_MAX_TOOL_CALLS,
+    )
+    return timeout, max_tool_calls
+
+
 # ---------------------------------------------------------------------------
 # hermes_tools.py code generator
 # ---------------------------------------------------------------------------
@@ -694,9 +713,7 @@ def _execute_remote(
     thread that communicates via request/response files.
     """
 
-    _cfg = _load_config()
-    timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
-    max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
+    timeout, max_tool_calls = _resolve_execution_limits(_load_config())
 
     session_tools = set(enabled_tools) if enabled_tools else set()
     sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
@@ -904,9 +921,7 @@ def execute_code(
     from tools.terminal_tool import _interrupt_event
 
     # Resolve config
-    _cfg = _load_config()
-    timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
-    max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
+    timeout, max_tool_calls = _resolve_execution_limits(_load_config())
 
     # Determine which tools the sandbox can call
     session_tools = set(enabled_tools) if enabled_tools else set()
